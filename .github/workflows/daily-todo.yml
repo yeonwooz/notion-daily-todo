@@ -19,4 +19,6 @@ jobs:
       - name: Create daily TODO page
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          PARENT_PAGE_ID: ${{ secrets.PARENT_PAGE_ID }}
+          TEMPLATE_PAGE_ID: ${{ secrets.TEMPLATE_PAGE_ID }}
         run: python create_daily_todo.py

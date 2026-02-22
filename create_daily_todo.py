@@ -9,9 +9,9 @@ import os
 import urllib.request
 from datetime import date, timedelta
 
-NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
-PARENT_PAGE_ID = "2debb67ca90c807784c0f58e374a764d"
-TEMPLATE_PAGE_ID = "30fbb67ca90c819383c8c5eed1794caf"
+NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+PARENT_PAGE_ID = os.environ["PARENT_PAGE_ID"]
+TEMPLATE_PAGE_ID = os.environ["TEMPLATE_PAGE_ID"]
 API_BASE = "https://api.notion.com/v1"
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
