@@ -107,7 +107,7 @@ def build_page(today: str, template_children: list[dict], carryover: dict[str, l
                 children.append({
                     "object": "block", "type": "to_do",
                     "to_do": {
-                        "rich_text": [{"text": {"content": f"[이월] {task}"}}],
+                        "rich_text": [{"text": {"content": task}}],
                         "checked": False,
                     },
                 })
@@ -123,7 +123,7 @@ def build_page(today: str, template_children: list[dict], carryover: dict[str, l
             children.append({
                 "object": "block", "type": "to_do",
                 "to_do": {
-                    "rich_text": [{"text": {"content": f"[이월] {task}"}}],
+                    "rich_text": [{"text": {"content": task}}],
                     "checked": False,
                 },
             })
