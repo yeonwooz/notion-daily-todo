@@ -51,17 +51,22 @@ def find_yesterday_page(yesterday: str) -> str | None:
     return None
 
 
-def extract_unchecked_todos(blocks: list[dict]) -> list[dict]:
-    """미완료(unchecked) to_do 블록만 추출한다."""
-    unchecked = []
+def extract_unchecked_by_category(blocks: list[dict]) -> dict[str, list[str]]:
+    """미완료(unchecked) to_do 블록을 카테고리별로 추출한다."""
+    result: dict[str, list[str]] = {}
+    current_category = ""
     for b in blocks:
-        if b.get("type") == "to_do" and not b["to_do"].get("checked", False):
+        if b.get("type") == "heading_2":
+            current_category = "".join(
+                t.get("plain_text", "") for t in b["heading_2"].get("rich_text", [])
+            )
+        elif b.get("type") == "to_do" and not b["to_do"].get("checked", False):
             text = "".join(
                 t.get("plain_text", "") for t in b["to_do"].get("rich_text", [])
             )
             if text:
-                unchecked.append(text)
-    return unchecked
+                result.setdefault(current_category, []).append(text)
+    return result
 
 
 def blocks_to_children(blocks: list[dict]) -> list[dict]:
@@ -87,20 +92,38 @@ def blocks_to_children(blocks: list[dict]) -> list[dict]:
     return children
 
 
-def build_page(today: str, template_children: list[dict], carryover: list[str]) -> dict:
-    children = list(template_children)
+def build_page(today: str, template_children: list[dict], carryover: dict[str, list[str]]) -> dict:
+    children = []
+    current_category = ""
 
-    if carryover:
+    for block in template_children:
+        children.append(block)
+        # heading_2 직후: 해당 카테고리의 이월 항목을 먼저 삽입
+        if block.get("type") == "heading_2":
+            current_category = "".join(
+                t.get("plain_text", "") for t in block["heading_2"]["rich_text"]
+            )
+            for task in carryover.pop(current_category, []):
+                children.append({
+                    "object": "block", "type": "to_do",
+                    "to_do": {
+                        "rich_text": [{"text": {"content": f"[이월] {task}"}}],
+                        "checked": False,
+                    },
+                })
+
+    # 템플릿에 없는 카테고리의 이월 항목 처리
+    for category, tasks in carryover.items():
         children.append({"object": "block", "type": "divider", "divider": {}})
         children.append({
             "object": "block", "type": "heading_2",
-            "heading_2": {"rich_text": [{"text": {"content": "이월 항목"}}]},
+            "heading_2": {"rich_text": [{"text": {"content": category or "기타"}}]},
         })
-        for task in carryover:
+        for task in tasks:
             children.append({
                 "object": "block", "type": "to_do",
                 "to_do": {
-                    "rich_text": [{"text": {"content": task}}],
+                    "rich_text": [{"text": {"content": f"[이월] {task}"}}],
                     "checked": False,
                 },
             })
@@ -122,14 +145,15 @@ def main():
     template_blocks = get_blocks(TEMPLATE_PAGE_ID)
     template_children = blocks_to_children(template_blocks)
 
-    # 2. 전날 페이지에서 미완료 항목 가져오기
-    carryover = []
+    # 2. 전날 페이지에서 미완료 항목을 카테고리별로 가져오기
+    carryover: dict[str, list[str]] = {}
     print(f"전날({yesterday}) 페이지 검색 중...")
     yesterday_id = find_yesterday_page(yesterday)
     if yesterday_id:
         yesterday_blocks = get_blocks(yesterday_id)
-        carryover = extract_unchecked_todos(yesterday_blocks)
-        print(f"  미완료 항목 {len(carryover)}개 발견")
+        carryover = extract_unchecked_by_category(yesterday_blocks)
+        total = sum(len(v) for v in carryover.values())
+        print(f"  미완료 항목 {total}개 발견 ({', '.join(f'{k}:{len(v)}' for k, v in carryover.items())})")
     else:
         print("  전날 페이지 없음")
 
