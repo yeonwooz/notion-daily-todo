@@ -1,0 +1,22 @@
+name: Create Daily TODO
+
+on:
+  schedule:
+    # KST 07:00 = UTC 22:00 (전날)
+    - cron: "0 22 * * *"
+  workflow_dispatch: # 수동 실행 가능
+
+jobs:
+  create-todo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create daily TODO page
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: python create_daily_todo.py
