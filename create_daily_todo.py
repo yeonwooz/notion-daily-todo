@@ -7,11 +7,12 @@
 import json
 import os
 import urllib.request
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 PARENT_PAGE_ID = os.environ["PARENT_PAGE_ID"]
 TEMPLATE_PAGE_ID = os.environ["TEMPLATE_PAGE_ID"]
+KST = timezone(timedelta(hours=9))
 API_BASE = "https://api.notion.com/v1"
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -137,8 +138,8 @@ def build_page(today: str, template_children: list[dict], carryover: dict[str, l
 
 
 def main():
-    today = date.today().isoformat()
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    yesterday = (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
 
     # 1. 템플릿 페이지에서 기본 할 일 읽기
     print("템플릿 페이지 읽는 중...")
