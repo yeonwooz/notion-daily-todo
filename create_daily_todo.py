@@ -1,17 +1,30 @@
 """매일 Notion에 체크박스 TODO 페이지를 자동 생성하는 스크립트
 
-- Notion 템플릿 페이지에서 기본 할 일을 읽어옴
-- 전날 TODO 페이지에서 미완료 항목을 이월
+콘텐츠 소스:
+1. 템플릿 페이지 (TEMPLATE_PAGE_ID) — 기본 카테고리 + 고정 할 일
+2. 전날 TODO 페이지 — 미완료 항목 이월
+3. 연간 할일 페이지 (YEARLY_TODO_PAGE_ID) — "할 일" 섹션의 반복 패턴(매일/요일/날짜지정/빠른시일 등)
+4. iCloud 캘린더 — 오늘 일정
+
+3, 4 항목은 Claude API(Sonnet 4.6)가 템플릿 카테고리(업무/개인/공부)로 분류한다.
 """
 
 import json
 import os
+import re
 import urllib.request
 from datetime import datetime, timedelta, timezone
+
+import anthropic
+import caldav
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 PARENT_PAGE_ID = os.environ["PARENT_PAGE_ID"]
 TEMPLATE_PAGE_ID = os.environ["TEMPLATE_PAGE_ID"]
+YEARLY_TODO_PAGE_ID = os.environ.get("YEARLY_TODO_PAGE_ID", "")
+APPLE_ID = os.environ.get("APPLE_ID", "")
+APPLE_APP_PASSWORD = os.environ.get("APPLE_APP_PASSWORD", "")
+
 KST = timezone(timedelta(hours=9))
 API_BASE = "https://api.notion.com/v1"
 HEADERS = {
@@ -19,6 +32,11 @@ HEADERS = {
     "Content-Type": "application/json; charset=utf-8",
     "Notion-Version": "2022-06-28",
 }
+
+WEEKDAY_KO = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
+
+
+# ─────────────────────────── Notion API ───────────────────────────
 
 
 def api_request(method: str, path: str, body: dict | None = None) -> dict:
@@ -34,6 +52,13 @@ def get_blocks(page_id: str) -> list[dict]:
     """페이지의 블록 목록을 가져온다."""
     result = api_request("GET", f"/blocks/{page_id}/children?page_size=100")
     return result.get("results", [])
+
+
+def block_text(block: dict) -> str:
+    btype = block.get("type")
+    if btype not in block:
+        return ""
+    return "".join(t.get("plain_text", "") for t in block[btype].get("rich_text", []))
 
 
 def find_yesterday_page(yesterday: str) -> str | None:
@@ -58,13 +83,9 @@ def extract_unchecked_by_category(blocks: list[dict]) -> dict[str, list[str]]:
     current_category = ""
     for b in blocks:
         if b.get("type") == "heading_2":
-            current_category = "".join(
-                t.get("plain_text", "") for t in b["heading_2"].get("rich_text", [])
-            )
+            current_category = block_text(b)
         elif b.get("type") == "to_do" and not b["to_do"].get("checked", False):
-            text = "".join(
-                t.get("plain_text", "") for t in b["to_do"].get("rich_text", [])
-            )
+            text = block_text(b)
             if text:
                 result.setdefault(current_category, []).append(text)
     return result
@@ -93,27 +114,277 @@ def blocks_to_children(blocks: list[dict]) -> list[dict]:
     return children
 
 
-def build_page(today: str, template_children: list[dict], carryover: dict[str, list[str]]) -> dict:
+def to_do_block(text: str) -> dict:
+    return {
+        "object": "block", "type": "to_do",
+        "to_do": {
+            "rich_text": [{"text": {"content": text}}],
+            "checked": False,
+        },
+    }
+
+
+def template_categories(template_children: list[dict]) -> list[str]:
+    """템플릿의 heading_2 텍스트(카테고리) 목록을 순서대로 반환."""
+    result = []
+    for b in template_children:
+        if b.get("type") == "heading_2":
+            text = "".join(t.get("plain_text", "") for t in b["heading_2"]["rich_text"])
+            if text:
+                result.append(text)
+    return result
+
+
+# ─────────────────── 연간 할일 페이지의 반복 패턴 파서 ───────────────────
+
+
+def heading_matches_today(heading: str, today: datetime) -> bool:
+    """heading이 오늘 날짜에 해당하는 반복 패턴이면 True."""
+    h = heading.strip()
+    weekday_idx = today.weekday()  # Mon=0
+    weekday_name = WEEKDAY_KO[weekday_idx]
+
+    if "매일" in h:
+        return True
+    if weekday_name in h and "마다" in h:
+        return True
+    if "주말" in h and weekday_idx >= 5:
+        return True
+    if "평일" in h and weekday_idx < 5:
+        return True
+
+    m = re.search(r"매월\s*(\d{1,2})\s*일", h)
+    if m and int(m.group(1)) == today.day:
+        return True
+
+    # YYYY-MM-DD 또는 YYYY.M.D
+    m = re.search(r"(\d{4})[\-.](\d{1,2})[\-.](\d{1,2})", h)
+    if m:
+        y, mo, d = (int(x) for x in m.groups())
+        if (y, mo, d) == (today.year, today.month, today.day):
+            return True
+
+    return False
+
+
+def is_urgent_pool_heading(heading: str) -> bool:
+    return "빠른 시일" in heading or "빠른시일" in heading
+
+
+def parse_recurring_todos(
+    blocks: list[dict], today: datetime,
+) -> tuple[list[dict], list[str]]:
+    """연간 할일 페이지의 "# 할 일" 섹션 이하를 파싱.
+
+    Returns:
+        recurring: [{"section": "매일 아침 할 일", "task": "리더십 연습 두페이지 읽기"}, ...]
+        urgent_pool: 빠른 시일 내 처리할 일들 (LLM이 1-2개만 선별)
+    """
+    recurring: list[dict] = []
+    urgent_pool: list[str] = []
+    in_todo_root = False  # "# 할 일" 헤딩 이하인지
+    current_h2 = ""
+    matched = False
+    in_urgent = False
+
+    for b in blocks:
+        btype = b.get("type")
+        if btype == "heading_1":
+            text = block_text(b)
+            in_todo_root = "할 일" in text
+            current_h2 = ""
+            matched = False
+            in_urgent = False
+            continue
+        if not in_todo_root:
+            continue
+
+        if btype == "heading_2":
+            current_h2 = block_text(b)
+            matched = heading_matches_today(current_h2, today)
+            in_urgent = is_urgent_pool_heading(current_h2)
+        elif btype == "to_do":
+            text = block_text(b)
+            if not text:
+                continue
+            if b["to_do"].get("checked", False):
+                continue
+            if matched:
+                recurring.append({"section": current_h2, "task": text})
+            elif in_urgent:
+                urgent_pool.append(text)
+
+    return recurring, urgent_pool
+
+
+# ─────────────────────── iCloud Calendar ───────────────────────
+
+
+def collect_calendar(today: datetime) -> list[dict]:
+    """오늘 KST 00:00~24:00 일정을 iCloud CalDAV로 수집."""
+    if not APPLE_ID or not APPLE_APP_PASSWORD:
+        print("[Calendar] APPLE_ID/APPLE_APP_PASSWORD 미설정 — 건너뜀")
+        return []
+
+    try:
+        client = caldav.DAVClient(
+            url="https://caldav.icloud.com",
+            username=APPLE_ID,
+            password=APPLE_APP_PASSWORD,
+        )
+        calendars = client.principal().calendars()
+    except Exception as e:
+        print(f"[Calendar] iCloud 연결 실패: {e}")
+        return []
+
+    start = today.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    events: list[dict] = []
+
+    for cal in calendars:
+        try:
+            found = cal.search(start=start, end=end, event=True, expand=True)
+        except Exception as e:
+            print(f"[Calendar] '{cal.name}' 검색 실패: {e}")
+            continue
+        for ev in found:
+            try:
+                v = ev.vobject_instance.vevent
+                summary = str(v.summary.value) if hasattr(v, "summary") else "제목 없음"
+                dtstart = v.dtstart.value
+                if hasattr(dtstart, "hour"):
+                    time_str = dtstart.astimezone(KST).strftime("%H:%M")
+                    label = f"[{time_str}] {summary}"
+                else:
+                    label = f"[종일] {summary}"
+                events.append({"label": label, "summary": summary})
+            except Exception:
+                continue
+
+    print(f"[Calendar] {len(events)}개 일정 수집")
+    return events
+
+
+# ─────────────────────── Claude 분류기 ───────────────────────
+
+
+CLASSIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "assignments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "items": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["category", "items"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["assignments"],
+    "additionalProperties": False,
+}
+
+
+def classify_items(
+    categories: list[str],
+    recurring: list[dict],
+    calendar_events: list[dict],
+    urgent_pool: list[str],
+    today: datetime,
+) -> dict[str, list[str]]:
+    """반복 할 일 + 캘린더 + 빠른시일 추천을 카테고리별로 분류.
+
+    Returns: {"업무": [...], "개인": [...], "공부": [...]}
+    """
+    if not (recurring or calendar_events or urgent_pool):
+        return {c: [] for c in categories}
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("[Classifier] ANTHROPIC_API_KEY 미설정 — 분류 없이 첫 카테고리에 모두 추가")
+        fallback = [it["task"] for it in recurring]
+        fallback += [e["label"] for e in calendar_events]
+        return {c: (fallback if c == categories[0] else []) for c in categories}
+
+    weekday = WEEKDAY_KO[today.weekday()]
+    recurring_lines = "\n".join(f"- ({it['section']}) {it['task']}" for it in recurring) or "(없음)"
+    calendar_lines = "\n".join(f"- {e['label']}" for e in calendar_events) or "(없음)"
+    urgent_lines = "\n".join(f"- {t}" for t in urgent_pool) or "(없음)"
+    cat_list = ", ".join(categories)
+
+    prompt = f"""오늘은 {today.strftime("%Y-%m-%d")} {weekday}입니다.
+
+다음 할 일 항목들을 [{cat_list}] 중 하나의 카테고리로 분류해주세요.
+
+[반복 할 일 (오늘 해당)]
+{recurring_lines}
+
+[오늘의 캘린더 일정]
+{calendar_lines}
+
+[빠른 시일 내 처리할 일들 — 이 중 오늘 추천할 만한 1-2개만 골라서 분류]
+{urgent_lines}
+
+규칙:
+- 모든 카테고리를 응답에 포함하되, 항목이 없으면 빈 배열로
+- 캘린더 일정은 [HH:MM] 시간 표기를 그대로 유지
+- 반복 할 일의 (섹션) 표기는 제거하고 task 텍스트만 사용
+- 빠른시일 풀에서는 오늘의 요일/일정에 맞는 1-2개만 선별 (없으면 0개)
+- 각 항목은 정확히 한 카테고리에만 배치
+"""
+
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        output_config={
+            "format": {"type": "json_schema", "schema": CLASSIFY_SCHEMA},
+        },
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = next(b.text for b in response.content if b.type == "text")
+    data = json.loads(text)
+
+    result = {c: [] for c in categories}
+    for entry in data["assignments"]:
+        cat = entry["category"]
+        if cat in result:
+            result[cat].extend(entry["items"])
+        else:
+            result.setdefault(categories[0], []).extend(entry["items"])
+
+    print(f"[Classifier] " + ", ".join(f"{c}:{len(v)}" for c, v in result.items()))
+    return result
+
+
+# ─────────────────────── 페이지 빌드 ───────────────────────
+
+
+def build_page(
+    today: str,
+    template_children: list[dict],
+    carryover: dict[str, list[str]],
+    classified: dict[str, list[str]],
+) -> dict:
+    """템플릿 + 이월 + LLM 분류 결과를 합쳐서 페이지 children 구성."""
     children = []
     current_category = ""
 
     for block in template_children:
         children.append(block)
-        # heading_2 직후: 해당 카테고리의 이월 항목을 먼저 삽입
         if block.get("type") == "heading_2":
             current_category = "".join(
                 t.get("plain_text", "") for t in block["heading_2"]["rich_text"]
             )
             for task in carryover.pop(current_category, []):
-                children.append({
-                    "object": "block", "type": "to_do",
-                    "to_do": {
-                        "rich_text": [{"text": {"content": task}}],
-                        "checked": False,
-                    },
-                })
+                children.append(to_do_block(task))
+            for task in classified.get(current_category, []):
+                children.append(to_do_block(task))
 
-    # 템플릿에 없는 카테고리의 이월 항목 처리
+    # 템플릿에 없는 카테고리의 이월 항목
     for category, tasks in carryover.items():
         children.append({"object": "block", "type": "divider", "divider": {}})
         children.append({
@@ -121,13 +392,7 @@ def build_page(today: str, template_children: list[dict], carryover: dict[str, l
             "heading_2": {"rich_text": [{"text": {"content": category or "기타"}}]},
         })
         for task in tasks:
-            children.append({
-                "object": "block", "type": "to_do",
-                "to_do": {
-                    "rich_text": [{"text": {"content": task}}],
-                    "checked": False,
-                },
-            })
+            children.append(to_do_block(task))
 
     return {
         "parent": {"type": "page_id", "page_id": PARENT_PAGE_ID},
@@ -137,32 +402,45 @@ def build_page(today: str, template_children: list[dict], carryover: dict[str, l
     }
 
 
-def main():
-    today = datetime.now(KST).strftime("%Y-%m-%d")
-    yesterday = (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
+# ─────────────────────── main ───────────────────────
 
-    # 1. 템플릿 페이지에서 기본 할 일 읽기
+
+def main():
+    now = datetime.now(KST)
+    today_str = now.strftime("%Y-%m-%d")
+    yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
     print("템플릿 페이지 읽는 중...")
     template_blocks = get_blocks(TEMPLATE_PAGE_ID)
     template_children = blocks_to_children(template_blocks)
+    categories = template_categories(template_children)
+    print(f"  카테고리: {categories}")
 
-    # 2. 전날 페이지에서 미완료 항목을 카테고리별로 가져오기
     carryover: dict[str, list[str]] = {}
-    print(f"전날({yesterday}) 페이지 검색 중...")
-    yesterday_id = find_yesterday_page(yesterday)
+    print(f"전날({yesterday_str}) 페이지 검색 중...")
+    yesterday_id = find_yesterday_page(yesterday_str)
     if yesterday_id:
-        yesterday_blocks = get_blocks(yesterday_id)
-        carryover = extract_unchecked_by_category(yesterday_blocks)
+        carryover = extract_unchecked_by_category(get_blocks(yesterday_id))
         total = sum(len(v) for v in carryover.values())
-        print(f"  미완료 항목 {total}개 발견 ({', '.join(f'{k}:{len(v)}' for k, v in carryover.items())})")
+        print(f"  미완료 {total}개 이월")
     else:
         print("  전날 페이지 없음")
 
-    # 3. 오늘 TODO 페이지 생성
-    body = build_page(today, template_children, carryover)
+    recurring: list[dict] = []
+    urgent_pool: list[str] = []
+    if YEARLY_TODO_PAGE_ID:
+        print("연간 할일 페이지 파싱 중...")
+        yearly_blocks = get_blocks(YEARLY_TODO_PAGE_ID)
+        recurring, urgent_pool = parse_recurring_todos(yearly_blocks, now)
+        print(f"  반복 {len(recurring)}개, 빠른시일 풀 {len(urgent_pool)}개")
+
+    calendar_events = collect_calendar(now)
+
+    classified = classify_items(categories, recurring, calendar_events, urgent_pool, now)
+
+    body = build_page(today_str, template_children, carryover, classified)
     result = api_request("POST", "/pages", body)
-    url = result.get("url", "")
-    print(f"[{today} TODO] 생성 완료: {url}")
+    print(f"[{today_str} TODO] 생성 완료: {result.get('url', '')}")
 
 
 if __name__ == "__main__":

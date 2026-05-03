@@ -15,10 +15,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
       - name: Create daily TODO page
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           PARENT_PAGE_ID: ${{ secrets.PARENT_PAGE_ID }}
           TEMPLATE_PAGE_ID: ${{ secrets.TEMPLATE_PAGE_ID }}
+          YEARLY_TODO_PAGE_ID: ${{ secrets.YEARLY_TODO_PAGE_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python create_daily_todo.py
