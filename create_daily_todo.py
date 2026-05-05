@@ -1,9 +1,16 @@
 """매일 Notion에 체크박스 TODO 페이지를 자동 생성하는 스크립트
 
+페이지 계층:
+  ROOT_PAGE_ID ("할일")
+    └── {YYYY} 할일  (ensure_year_page가 매년 자동 생성)
+          ├── # 할 일  (사용자가 채워두는 yearly 반복 패턴)
+          ├── YYYY-MM (월별 sub-page, ensure_month_page가 자동 생성)
+          │     └── YYYY-MM-DD TODO (매일 페이지)
+
 콘텐츠 소스:
 1. 템플릿 페이지 (TEMPLATE_PAGE_ID) — 기본 카테고리 + 고정 할 일
 2. 전날 TODO 페이지 — 미완료 항목 이월
-3. 연간 할일 페이지 (YEARLY_TODO_PAGE_ID) — "할 일" 섹션의 반복 패턴(매일/요일/날짜지정/빠른시일 등)
+3. {YYYY} 할일 페이지의 "# 할 일" 섹션 — 반복 패턴(매일/요일/날짜지정/빠른시일 등)
 4. iCloud 캘린더 — 오늘 일정
 
 3, 4 항목은 Claude API(Sonnet 4.6)가 템플릿 카테고리(업무/개인/공부)로 분류한다.
@@ -19,9 +26,8 @@ import anthropic
 import caldav
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-PARENT_PAGE_ID = os.environ["PARENT_PAGE_ID"]
+ROOT_PAGE_ID = os.environ["ROOT_PAGE_ID"]
 TEMPLATE_PAGE_ID = os.environ["TEMPLATE_PAGE_ID"]
-YEARLY_TODO_PAGE_ID = os.environ.get("YEARLY_TODO_PAGE_ID", "")
 APPLE_ID = os.environ.get("APPLE_ID", "")
 APPLE_APP_PASSWORD = os.environ.get("APPLE_APP_PASSWORD", "")
 
@@ -49,9 +55,19 @@ def api_request(method: str, path: str, body: dict | None = None) -> dict:
 
 
 def get_blocks(page_id: str) -> list[dict]:
-    """페이지의 블록 목록을 가져온다."""
-    result = api_request("GET", f"/blocks/{page_id}/children?page_size=100")
-    return result.get("results", [])
+    """페이지의 모든 블록을 가져온다 (paginated)."""
+    blocks: list[dict] = []
+    cursor: str | None = None
+    while True:
+        path = f"/blocks/{page_id}/children?page_size=100"
+        if cursor:
+            path += f"&start_cursor={cursor}"
+        result = api_request("GET", path)
+        blocks.extend(result.get("results", []))
+        if not result.get("has_more"):
+            break
+        cursor = result.get("next_cursor")
+    return blocks
 
 
 def block_text(block: dict) -> str:
@@ -370,6 +386,7 @@ def classify_items(
 
 def build_page(
     today: str,
+    parent_page_id: str,
     template_children: list[dict],
     carryover: dict[str, list[str]],
     classified: dict[str, list[str]],
@@ -400,11 +417,68 @@ def build_page(
             children.append(to_do_block(task))
 
     return {
-        "parent": {"type": "page_id", "page_id": PARENT_PAGE_ID},
+        "parent": {"type": "page_id", "page_id": parent_page_id},
         "icon": {"type": "emoji", "emoji": "✅"},
         "properties": {"title": [{"text": {"content": f"{today} TODO"}}]},
         "children": children,
     }
+
+
+# ─────────────────── 연/월 sub-page 확보 ───────────────────
+
+
+MONTH_PAGE_PATTERN = re.compile(r"^\d{4}-\d{2}$")
+
+
+def ensure_year_page(year: str, root_id: str) -> str:
+    """ROOT 안에서 '{year} 할일' 페이지를 찾고, 없으면 생성하여 page_id 반환.
+
+    매년 1/1 첫 실행에서 자동으로 새 연도 페이지를 만든다. 'yearly 반복 패턴
+    (# 할 일 섹션)'은 자동 복사하지 않으므로 사용자가 새 페이지에 직접 채워야
+    매일 페이지에 반복 task가 들어간다.
+    """
+    title = f"{year} 할일"
+    for b in get_blocks(root_id):
+        if b.get("type") != "child_page":
+            continue
+        if b["child_page"].get("title", "") == title:
+            return b["id"]
+
+    print(f"[Year] '{title}' 페이지 신규 생성")
+    result = api_request("POST", "/pages", {
+        "parent": {"type": "page_id", "page_id": root_id},
+        "icon": {"type": "emoji", "emoji": "🗓️"},
+        "properties": {"title": [{"text": {"content": title}}]},
+    })
+    return result["id"]
+
+
+def ensure_month_page(year_month: str, parent_id: str, existing: dict[str, str]) -> str:
+    """parent_id 안에서 '{YYYY-MM}' sub-page를 찾고, 없으면 생성하여 page_id 반환."""
+    if year_month in existing:
+        return existing[year_month]
+
+    print(f"[Month] '{year_month}' sub-page 신규 생성")
+    result = api_request("POST", "/pages", {
+        "parent": {"type": "page_id", "page_id": parent_id},
+        "icon": {"type": "emoji", "emoji": "🗂️"},
+        "properties": {"title": [{"text": {"content": year_month}}]},
+    })
+    page_id = result["id"]
+    existing[year_month] = page_id
+    return page_id
+
+
+def collect_existing_month_pages(parent_id: str) -> dict[str, str]:
+    """parent_id 직속의 'YYYY-MM' 월 sub-page id를 수집."""
+    archives: dict[str, str] = {}
+    for b in get_blocks(parent_id):
+        if b.get("type") != "child_page":
+            continue
+        title = b["child_page"].get("title", "")
+        if MONTH_PAGE_PATTERN.match(title):
+            archives[title] = b["id"]
+    return archives
 
 
 # ─────────────────────── main ───────────────────────
@@ -414,6 +488,15 @@ def main():
     now = datetime.now(KST)
     today_str = now.strftime("%Y-%m-%d")
     yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    current_month = now.strftime("%Y-%m")
+    current_year = now.strftime("%Y")
+
+    print(f"{current_year} 할일 페이지 확보 중...")
+    year_page_id = ensure_year_page(current_year, ROOT_PAGE_ID)
+
+    print(f"월별 sub-page 확보 중... (현재 {current_month})")
+    existing_archives = collect_existing_month_pages(year_page_id)
+    month_page_id = ensure_month_page(current_month, year_page_id, existing_archives)
 
     print("템플릿 페이지 읽는 중...")
     template_blocks = get_blocks(TEMPLATE_PAGE_ID)
@@ -431,19 +514,15 @@ def main():
     else:
         print("  전날 페이지 없음")
 
-    recurring: list[dict] = []
-    urgent_pool: list[str] = []
-    if YEARLY_TODO_PAGE_ID:
-        print("연간 할일 페이지 파싱 중...")
-        yearly_blocks = get_blocks(YEARLY_TODO_PAGE_ID)
-        recurring, urgent_pool = parse_recurring_todos(yearly_blocks, now)
-        print(f"  반복 {len(recurring)}개, 빠른시일 풀 {len(urgent_pool)}개")
+    print(f"{current_year} 할일 페이지의 # 할 일 섹션 파싱 중...")
+    recurring, urgent_pool = parse_recurring_todos(get_blocks(year_page_id), now)
+    print(f"  반복 {len(recurring)}개, 빠른시일 풀 {len(urgent_pool)}개")
 
     calendar_events = collect_calendar(now)
 
     classified = classify_items(categories, recurring, calendar_events, urgent_pool, now)
 
-    body = build_page(today_str, template_children, carryover, classified)
+    body = build_page(today_str, month_page_id, template_children, carryover, classified)
     result = api_request("POST", "/pages", body)
     print(f"[{today_str} TODO] 생성 완료: {result.get('url', '')}")
 
