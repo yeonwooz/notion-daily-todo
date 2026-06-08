@@ -384,6 +384,14 @@ def classify_items(
 # ─────────────────────── 페이지 빌드 ───────────────────────
 
 
+def _todo_block_text(block: dict) -> str:
+    """to_do 블록의 텍스트를 추출한다 (plain_text 우선, 없으면 text.content)."""
+    parts = block.get("to_do", {}).get("rich_text", [])
+    return "".join(
+        rt.get("plain_text") or rt.get("text", {}).get("content", "") for rt in parts
+    ).strip()
+
+
 def build_page(
     today: str,
     parent_page_id: str,
@@ -391,30 +399,71 @@ def build_page(
     carryover: dict[str, list[str]],
     classified: dict[str, list[str]],
 ) -> dict:
-    """템플릿 + 이월 + LLM 분류 결과를 합쳐서 페이지 children 구성."""
+    """템플릿 + 이월 + LLM 분류 결과를 합쳐서 페이지 children 구성.
+
+    이월(carryover)은 "오늘 다시 생성되지 않는 일회성 미완료 task"만 가져온다.
+    매일 재생성되는 템플릿 고정 task와 반복/캘린더 분류 task는 이월 대상에서
+    제외 — 이월과 재생성이 겹쳐 매일 중복 누적되던 문제 방지.
+    """
     children = []
     current_category = ""
+    seen: set[str] = set()  # 이미 추가한 task 텍스트 (중복 방지)
+
+    def add_task(text: str) -> None:
+        key = text.strip()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        children.append(to_do_block(key))
+
+    # 오늘 새로 생성되는 task 텍스트 (템플릿 고정 + 분류) — 이월 제외 기준
+    regenerated: set[str] = set()
+    for block in template_children:
+        if block.get("type") == "to_do":
+            t = _todo_block_text(block)
+            if t:
+                regenerated.add(t)
+    for tasks in classified.values():
+        regenerated.update(t.strip() for t in tasks if t.strip())
+
+    # 이월은 오늘 재생성되지 않는 일회성 task만 남긴다
+    carryover = {
+        category: [t for t in tasks if t.strip() and t.strip() not in regenerated]
+        for category, tasks in carryover.items()
+    }
 
     for block in template_children:
+        # 템플릿 고정 task도 중복 추적 대상에 포함
+        if block.get("type") == "to_do":
+            key = _todo_block_text(block)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            children.append(block)
+            continue
+
         children.append(block)
         if block.get("type") == "heading_2":
             current_category = "".join(
                 t.get("plain_text", "") for t in block["heading_2"]["rich_text"]
             )
             for task in carryover.pop(current_category, []):
-                children.append(to_do_block(task))
+                add_task(task)
             for task in classified.get(current_category, []):
-                children.append(to_do_block(task))
+                add_task(task)
 
-    # 템플릿에 없는 카테고리의 이월 항목
+    # 템플릿에 없는 카테고리의 이월 항목 (이미 추가된 task 제외)
     for category, tasks in carryover.items():
+        fresh = [t for t in tasks if t.strip() and t.strip() not in seen]
+        if not fresh:
+            continue
         children.append({"object": "block", "type": "divider", "divider": {}})
         children.append({
             "object": "block", "type": "heading_2",
             "heading_2": {"rich_text": [{"text": {"content": category or "기타"}}]},
         })
-        for task in tasks:
-            children.append(to_do_block(task))
+        for task in fresh:
+            add_task(task)
 
     return {
         "parent": {"type": "page_id", "page_id": parent_page_id},

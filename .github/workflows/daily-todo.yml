@@ -2,8 +2,8 @@ name: Create Daily TODO
 
 on:
   schedule:
-    # KST 07:00 = UTC 22:00 (전날)
-    - cron: "0 22 * * *"
+    # KST 06:00 = UTC 21:00 (전날)
+    - cron: "0 21 * * *"
   workflow_dispatch: # 수동 실행 가능
 
 jobs:
