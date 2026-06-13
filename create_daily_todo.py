@@ -345,10 +345,11 @@ def classify_items(
 {urgent_lines}
 
 규칙:
+- [오늘의 캘린더 일정]과 [반복 할 일]의 모든 항목은 빠짐없이 분류 (드롭 금지)
 - 모든 카테고리를 응답에 포함하되, 항목이 없으면 빈 배열로
-- 캘린더 일정은 [HH:MM] 시간 표기를 그대로 유지
+- 캘린더 일정은 [HH:MM] / [종일] 시간 표기를 그대로 유지
 - 반복 할 일의 (섹션) 표기는 제거하고 task 텍스트만 사용
-- 빠른시일 풀에서는 오늘의 요일/일정에 맞는 1-2개만 선별 (없으면 0개)
+- "1-2개만 선별"은 오직 [빠른 시일 내 처리할 일들]에만 적용 — 오늘의 요일/일정에 맞는 1-2개만 (없으면 0개)
 - 각 항목은 정확히 한 카테고리에만 배치
 
 분류 가이드 (카테고리가 업무/개인/공부일 때):
@@ -377,8 +378,85 @@ def classify_items(
         else:
             result.setdefault(categories[0], []).extend(entry["items"])
 
+    must_include = [e["label"] for e in calendar_events] + [it["task"] for it in recurring]
+    included = {x for items in result.values() for x in items}
+    missing = [m for m in must_include if m not in included]
+    if missing:
+        print(f"[Classifier] LLM이 누락한 캘린더/반복 {len(missing)}개 → 2차 분류")
+        recovered = _recover_missing_items(client, categories, missing, today)
+        for cat, items in recovered.items():
+            if cat in result:
+                result[cat].extend(items)
+
     print(f"[Classifier] " + ", ".join(f"{c}:{len(v)}" for c, v in result.items()))
     return result
+
+
+def _recover_missing_items(
+    client: "anthropic.Anthropic",
+    categories: list[str],
+    missing: list[str],
+    today: datetime,
+) -> dict[str, list[str]]:
+    """1차 분류에서 누락된 캘린더/반복 항목만 다시 분류한다.
+
+    실패 시 첫 카테고리로 폴백 (항목이 사라지지 않도록 보장).
+    """
+    weekday = WEEKDAY_KO[today.weekday()]
+    cat_list = ", ".join(categories)
+    lines = "\n".join(f"- {m}" for m in missing)
+
+    prompt = f"""오늘은 {today.strftime("%Y-%m-%d")} {weekday}입니다.
+
+아래 항목들을 [{cat_list}] 중 하나로 분류해주세요. **모든 항목을 반드시 포함**해야 합니다 (드롭 금지).
+
+[분류 대상]
+{lines}
+
+규칙:
+- 입력의 모든 항목을 응답에 포함 (입력 텍스트 그대로, 변형 금지)
+- 모든 카테고리를 응답에 포함하되, 항목이 없으면 빈 배열로
+- 각 항목은 정확히 한 카테고리에만 배치
+
+분류 가이드 (카테고리가 업무/개인/공부일 때):
+- 업무: 회사 일, 회의, 회사 스터디, 발표 준비 등
+- 개인: 자기관리, 회고/일기/원고/브이로그 등 창작·기록, 집안일, 취미, 운동, 약속, 가족 관련
+- 공부: 책 읽기, 어학(링글 등), 자격증 준비(데이터브릭스 등), 알고리즘, 기술 학습
+"""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            output_config={
+                "format": {"type": "json_schema", "schema": CLASSIFY_SCHEMA},
+            },
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = next(b.text for b in response.content if b.type == "text")
+        data = json.loads(text)
+    except Exception as e:
+        print(f"[Classifier] 2차 분류 실패 ({e}) — 누락 {len(missing)}개를 '{categories[0]}'로 폴백")
+        return {categories[0]: list(missing)}
+
+    out: dict[str, list[str]] = {c: [] for c in categories}
+    placed: set[str] = set()
+    for entry in data.get("assignments", []):
+        cat = entry.get("category")
+        items = [x for x in entry.get("items", []) if x in set(missing) and x not in placed]
+        if cat in out:
+            out[cat].extend(items)
+        else:
+            out[categories[0]].extend(items)
+        placed.update(items)
+
+    # 2차도 누락한 항목이 있으면 첫 카테고리로 폴백 (절대 사라지지 않도록)
+    still_missing = [m for m in missing if m not in placed]
+    if still_missing:
+        print(f"[Classifier] 2차도 누락한 {len(still_missing)}개를 '{categories[0]}'로 폴백")
+        out[categories[0]].extend(still_missing)
+
+    return out
 
 
 # ─────────────────────── 페이지 빌드 ───────────────────────
