@@ -258,23 +258,28 @@ def collect_calendar(today: datetime) -> list[dict]:
     events: list[dict] = []
 
     for cal in calendars:
+        cal_name = cal.get_display_name()
         try:
             found = cal.search(start=start, end=end, event=True, expand=True)
         except Exception as e:
-            print(f"[Calendar] '{cal.name}' 검색 실패: {e}")
+            print(f"[Calendar] '{cal_name}' 검색 실패: {e}")
             continue
         for ev in found:
             try:
-                v = ev.vobject_instance.vevent
-                summary = str(v.summary.value) if hasattr(v, "summary") else "제목 없음"
-                dtstart = v.dtstart.value
+                # caldav 2.0+에서 vobject 의존성이 제거됨 → icalendar API 사용.
+                # (구 ev.vobject_instance는 vobject 미설치 시 조용히 None을 반환해
+                #  모든 일정이 누락되던 버그가 있었음)
+                comp = ev.icalendar_component
+                summary = str(comp.get("summary", "제목 없음"))
+                dtstart = comp.get("dtstart").dt
                 if hasattr(dtstart, "hour"):
                     time_str = dtstart.astimezone(KST).strftime("%H:%M")
                     label = f"[{time_str}] {summary}"
                 else:
                     label = f"[종일] {summary}"
                 events.append({"label": label, "summary": summary})
-            except Exception:
+            except Exception as e:
+                print(f"[Calendar] '{cal_name}' 일정 파싱 실패: {type(e).__name__}: {e}")
                 continue
 
     print(f"[Calendar] {len(events)}개 일정 수집")
