@@ -253,9 +253,11 @@ def collect_calendar(today: datetime) -> list[dict]:
         print(f"[Calendar] iCloud 연결 실패: {e}")
         return []
 
+    today_date = today.date()
     start = today.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
     events: list[dict] = []
+    dropped = 0
 
     for cal in calendars:
         cal_name = cal.get_display_name()
@@ -272,6 +274,16 @@ def collect_calendar(today: datetime) -> list[dict]:
                 comp = ev.icalendar_component
                 summary = str(comp.get("summary", "제목 없음"))
                 dtstart = comp.get("dtstart").dt
+                dtend_prop = comp.get("dtend")
+                dtend = dtend_prop.dt if dtend_prop is not None else dtstart
+
+                # 종일 일정은 날짜만 있는 floating 값이라, caldav가 검색창을 UTC로
+                # 변환하는 과정에서 인접한 날(주로 어제) 일정이 오늘 창에 섞여 들어온다.
+                # 실제 일정 날짜가 KST 오늘에 걸치는지 명시적으로 한 번 더 거른다.
+                if not _event_on_kst_day(dtstart, dtend, today_date):
+                    dropped += 1
+                    continue
+
                 if hasattr(dtstart, "hour"):
                     time_str = dtstart.astimezone(KST).strftime("%H:%M")
                     label = f"[{time_str}] {summary}"
@@ -282,8 +294,26 @@ def collect_calendar(today: datetime) -> list[dict]:
                 print(f"[Calendar] '{cal_name}' 일정 파싱 실패: {type(e).__name__}: {e}")
                 continue
 
-    print(f"[Calendar] {len(events)}개 일정 수집")
+    msg = f"[Calendar] {len(events)}개 일정 수집"
+    if dropped:
+        msg += f" (KST 오늘 아닌 {dropped}개 제외)"
+    print(msg)
     return events
+
+
+def _event_on_kst_day(dtstart, dtend, day: "datetime.date") -> bool:
+    """일정이 KST 기준 `day`에 걸치는지 판정.
+
+    - 시간 지정 일정(datetime): KST로 변환한 시작~종료 날짜 구간이 day를 포함
+    - 종일 일정(date): iCal에서 dtend는 배타적(다음날) → [dtstart, dtend) 반열림 구간
+    """
+    if hasattr(dtstart, "hour"):  # 시간 지정
+        start_d = dtstart.astimezone(KST).date()
+        end_d = dtend.astimezone(KST).date() if hasattr(dtend, "hour") else start_d
+        return start_d <= day <= end_d
+    # 종일: dtend가 dtstart와 같거나 없으면 단일 종일로 간주
+    end_date = dtend if (dtend and dtend > dtstart) else dtstart + timedelta(days=1)
+    return dtstart <= day < end_date
 
 
 # ─────────────────────── Claude 분류기 ───────────────────────
