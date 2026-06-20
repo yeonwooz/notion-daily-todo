@@ -76,6 +76,44 @@ def block_text(block: dict) -> str:
     return "".join(t.get("plain_text", "") for t in block[btype].get("rich_text", []))
 
 
+def find_page_by_title(title: str) -> str | None:
+    """제목이 정확히 일치하는 페이지 id를 검색한다 (없으면 None)."""
+    body = {
+        "query": title,
+        "filter": {"value": "page", "property": "object"},
+        "page_size": 5,
+    }
+    result = api_request("POST", "/search", body)
+    for page in result.get("results", []):
+        title_parts = page.get("properties", {}).get("title", {}).get("title", [])
+        if "".join(t.get("plain_text", "") for t in title_parts).strip() == title:
+            return page["id"]
+    return None
+
+
+# haru-bot webhook이 "내일로 미루기"로 고른 항목을 그날 TODO 페이지의 이 heading 아래
+# 모아둔다. 다음 아침 생성 시 전날 페이지의 이 섹션만 읽어 오늘로 가져온다 (선택적 이월).
+DEFER_HEADING_KEY = "내일로"
+
+
+def collect_deferred_from_yesterday(yesterday: str) -> list[str]:
+    """전날 TODO 페이지의 '🔜 내일로' 섹션 to_do 텍스트(사용자가 내일로 미룬 항목)."""
+    page_id = find_page_by_title(f"{yesterday} TODO")
+    if not page_id:
+        return []
+    items: list[str] = []
+    in_defer = False
+    for b in get_blocks(page_id):
+        btype = b.get("type")
+        if btype == "heading_2":
+            in_defer = DEFER_HEADING_KEY in block_text(b)
+        elif btype == "to_do" and in_defer:
+            t = block_text(b).strip()
+            if t:
+                items.append(t)
+    return items
+
+
 def blocks_to_children(blocks: list[dict]) -> list[dict]:
     """템플릿 블록을 새 페이지용 children으로 변환한다."""
     children = []
@@ -283,6 +321,59 @@ def _event_on_kst_day(dtstart, dtend, day: "datetime.date") -> bool:
     # 종일: dtend가 dtstart와 같거나 없으면 단일 종일로 간주
     end_date = dtend if (dtend and dtend > dtstart) else dtstart + timedelta(days=1)
     return dtstart <= day < end_date
+
+
+# 일정 주체가 사용자 본인이 아니면(아래 인물의 일정) 기록하지 않는다.
+# 키워드 매칭이 아니라 Claude가 맥락으로 판단 — "경민 슈주 모임"처럼 경민이 주체인
+# 약속/레슨/모임/수업/인터뷰 등을 본인 할 일에서 걸러낸다.
+EXCLUDE_PERSON = "경민"
+
+
+def filter_others_calendar(events: list[dict], today: datetime) -> list[dict]:
+    """캘린더 일정 중 '경민'의 일정(본인 할 일 아님)을 Claude가 판단해 제외."""
+    if not events:
+        return events
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("[Calendar-Filter] ANTHROPIC_API_KEY 미설정 — 필터 없이 전체 유지")
+        return events
+
+    weekday = WEEKDAY_KO[today.weekday()]
+    listing = "\n".join(f"{i}: {e['label']}" for i, e in enumerate(events))
+    prompt = f"""오늘은 {today.strftime("%Y-%m-%d")} {weekday}입니다.
+아래는 사용자 캘린더에서 가져온 오늘 일정 목록입니다 (index: 일정).
+
+{listing}
+
+이 중 '{EXCLUDE_PERSON}'의 일정 — 즉 {EXCLUDE_PERSON}이(가) 주체이거나 {EXCLUDE_PERSON}을(를) 위한
+약속·레슨·모임·수업·인터뷰·픽업 등, 사용자 본인이 직접 할 일이 아닌 일정 — 은 기록에서 제외합니다.
+사용자 본인이 직접 하거나 챙겨야 하는 일정의 index만 keep 배열로 돌려주세요.
+판단이 애매하면 keep(남김)으로 둡니다.
+"""
+    schema = {
+        "type": "object",
+        "properties": {"keep": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["keep"],
+        "additionalProperties": False,
+    }
+    try:
+        client = anthropic.Anthropic()
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=512,
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = next(b.text for b in resp.content if b.type == "text")
+        keep = {i for i in json.loads(text)["keep"] if isinstance(i, int)}
+    except Exception as e:
+        print(f"[Calendar-Filter] 판단 실패({e}) — 필터 없이 전체 유지")
+        return events
+
+    kept = [e for i, e in enumerate(events) if i in keep]
+    dropped = [e["label"] for i, e in enumerate(events) if i not in keep]
+    if dropped:
+        print(f"[Calendar-Filter] {EXCLUDE_PERSON} 일정 {len(dropped)}개 제외: {dropped}")
+    return kept
 
 
 # ─────────────────────── Claude 분류기 ───────────────────────
@@ -586,6 +677,7 @@ def collect_existing_month_pages(parent_id: str) -> dict[str, str]:
 def main():
     now = datetime.now(KST)
     today_str = now.strftime("%Y-%m-%d")
+    yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     current_month = now.strftime("%Y-%m")
     current_year = now.strftime("%Y")
 
@@ -606,7 +698,12 @@ def main():
     recurring, urgent_pool = parse_recurring_todos(get_blocks(year_page_id), now)
     print(f"  반복 {len(recurring)}개, 빠른시일 풀 {len(urgent_pool)}개")
 
-    calendar_events = collect_calendar(now)
+    deferred = collect_deferred_from_yesterday(yesterday_str)
+    if deferred:
+        print(f"  어제 '내일로' 미룬 항목 {len(deferred)}개 가져옴")
+        recurring = recurring + [{"section": "내일로", "task": t} for t in deferred]
+
+    calendar_events = filter_others_calendar(collect_calendar(now), now)
 
     classified = classify_items(categories, recurring, calendar_events, urgent_pool, now)
 
