@@ -7,13 +7,12 @@
           ├── YYYY-MM (월별 sub-page, ensure_month_page가 자동 생성)
           │     └── YYYY-MM-DD TODO (매일 페이지)
 
-콘텐츠 소스:
+콘텐츠 소스 (모두 "오늘의 할일"만 — 전날 미완료 이월은 하지 않는다):
 1. 템플릿 페이지 (TEMPLATE_PAGE_ID) — 기본 카테고리 + 고정 할 일
-2. 전날 TODO 페이지 — 미완료 항목 이월
-3. {YYYY} 할일 페이지의 "# 할 일" 섹션 — 반복 패턴(매일/요일/날짜지정/빠른시일 등)
-4. iCloud 캘린더 — 오늘 일정
+2. {YYYY} 할일 페이지의 "# 할 일" 섹션 — 반복 패턴(매일/요일/날짜지정/빠른시일 등)
+3. iCloud 캘린더 — 오늘(KST) 일정
 
-3, 4 항목은 Claude API(Sonnet 4.6)가 템플릿 카테고리(업무/개인/공부)로 분류한다.
+2, 3 항목은 Claude API(Sonnet 4.6)가 템플릿 카테고리(업무/개인/공부)로 분류한다.
 """
 
 import json
@@ -75,36 +74,6 @@ def block_text(block: dict) -> str:
     if btype not in block:
         return ""
     return "".join(t.get("plain_text", "") for t in block[btype].get("rich_text", []))
-
-
-def find_yesterday_page(yesterday: str) -> str | None:
-    """전날 TODO 페이지 ID를 검색한다."""
-    body = {
-        "query": f"{yesterday} TODO",
-        "filter": {"value": "page", "property": "object"},
-        "page_size": 5,
-    }
-    result = api_request("POST", "/search", body)
-    for page in result.get("results", []):
-        title_parts = page.get("properties", {}).get("title", {}).get("title", [])
-        title = "".join(t.get("plain_text", "") for t in title_parts)
-        if title == f"{yesterday} TODO":
-            return page["id"]
-    return None
-
-
-def extract_unchecked_by_category(blocks: list[dict]) -> dict[str, list[str]]:
-    """미완료(unchecked) to_do 블록을 카테고리별로 추출한다."""
-    result: dict[str, list[str]] = {}
-    current_category = ""
-    for b in blocks:
-        if b.get("type") == "heading_2":
-            current_category = block_text(b)
-        elif b.get("type") == "to_do" and not b["to_do"].get("checked", False):
-            text = block_text(b)
-            if text:
-                result.setdefault(current_category, []).append(text)
-    return result
 
 
 def blocks_to_children(blocks: list[dict]) -> list[dict]:
@@ -387,9 +356,9 @@ def classify_items(
 - "1-2개만 선별"은 오직 [빠른 시일 내 처리할 일들]에만 적용 — 오늘의 요일/일정에 맞는 1-2개만 (없으면 0개)
 - 각 항목은 정확히 한 카테고리에만 배치
 
-분류 가이드 (카테고리가 업무/개인/공부일 때):
-- 업무: 회사 일, 회의, 회사 스터디, 발표 준비 등
-- 개인: 자기관리, 회고/일기/원고/브이로그 등 창작·기록, 집안일, 취미, 운동, 약속, 가족 관련
+분류 가이드 (카테고리가 일/생활/공부일 때):
+- 일: 회사 일, 회의, 회사 스터디, 발표 준비 등
+- 생활: 자기관리, 회고/일기/원고/브이로그 등 창작·기록, 집안일, 취미, 운동, 약속, 가족 관련
 - 공부: 책 읽기, 어학(링글 등), 자격증 준비(데이터브릭스 등), 알고리즘, 기술 학습
 """
 
@@ -453,9 +422,9 @@ def _recover_missing_items(
 - 모든 카테고리를 응답에 포함하되, 항목이 없으면 빈 배열로
 - 각 항목은 정확히 한 카테고리에만 배치
 
-분류 가이드 (카테고리가 업무/개인/공부일 때):
-- 업무: 회사 일, 회의, 회사 스터디, 발표 준비 등
-- 개인: 자기관리, 회고/일기/원고/브이로그 등 창작·기록, 집안일, 취미, 운동, 약속, 가족 관련
+분류 가이드 (카테고리가 일/생활/공부일 때):
+- 일: 회사 일, 회의, 회사 스터디, 발표 준비 등
+- 생활: 자기관리, 회고/일기/원고/브이로그 등 창작·기록, 집안일, 취미, 운동, 약속, 가족 관련
 - 공부: 책 읽기, 어학(링글 등), 자격증 준비(데이터브릭스 등), 알고리즘, 기술 학습
 """
 
@@ -509,14 +478,13 @@ def build_page(
     today: str,
     parent_page_id: str,
     template_children: list[dict],
-    carryover: dict[str, list[str]],
     classified: dict[str, list[str]],
 ) -> dict:
-    """템플릿 + 이월 + LLM 분류 결과를 합쳐서 페이지 children 구성.
+    """템플릿 + LLM 분류(오늘 캘린더/반복) 결과를 합쳐서 페이지 children 구성.
 
-    이월(carryover)은 "오늘 다시 생성되지 않는 일회성 미완료 task"만 가져온다.
-    매일 재생성되는 템플릿 고정 task와 반복/캘린더 분류 task는 이월 대상에서
-    제외 — 이월과 재생성이 겹쳐 매일 중복 누적되던 문제 방지.
+    매일 페이지는 "오늘의 할일"만 담는다 — 템플릿 고정 task + 오늘 KST 캘린더 일정 +
+    오늘 날짜/요일에 해당하는 반복 할 일. 전날 미완료 항목 이월(carryover)은 하지
+    않는다 (지난 일정/다른 요일 반복이 며칠씩 따라오는 누수 방지).
     """
     children = []
     current_category = ""
@@ -528,22 +496,6 @@ def build_page(
             return
         seen.add(key)
         children.append(to_do_block(key))
-
-    # 오늘 새로 생성되는 task 텍스트 (템플릿 고정 + 분류) — 이월 제외 기준
-    regenerated: set[str] = set()
-    for block in template_children:
-        if block.get("type") == "to_do":
-            t = _todo_block_text(block)
-            if t:
-                regenerated.add(t)
-    for tasks in classified.values():
-        regenerated.update(t.strip() for t in tasks if t.strip())
-
-    # 이월은 오늘 재생성되지 않는 일회성 task만 남긴다
-    carryover = {
-        category: [t for t in tasks if t.strip() and t.strip() not in regenerated]
-        for category, tasks in carryover.items()
-    }
 
     for block in template_children:
         # 템플릿 고정 task도 중복 추적 대상에 포함
@@ -560,23 +512,8 @@ def build_page(
             current_category = "".join(
                 t.get("plain_text", "") for t in block["heading_2"]["rich_text"]
             )
-            for task in carryover.pop(current_category, []):
-                add_task(task)
             for task in classified.get(current_category, []):
                 add_task(task)
-
-    # 템플릿에 없는 카테고리의 이월 항목 (이미 추가된 task 제외)
-    for category, tasks in carryover.items():
-        fresh = [t for t in tasks if t.strip() and t.strip() not in seen]
-        if not fresh:
-            continue
-        children.append({"object": "block", "type": "divider", "divider": {}})
-        children.append({
-            "object": "block", "type": "heading_2",
-            "heading_2": {"rich_text": [{"text": {"content": category or "기타"}}]},
-        })
-        for task in fresh:
-            add_task(task)
 
     return {
         "parent": {"type": "page_id", "page_id": parent_page_id},
@@ -649,7 +586,6 @@ def collect_existing_month_pages(parent_id: str) -> dict[str, str]:
 def main():
     now = datetime.now(KST)
     today_str = now.strftime("%Y-%m-%d")
-    yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     current_month = now.strftime("%Y-%m")
     current_year = now.strftime("%Y")
 
@@ -666,16 +602,6 @@ def main():
     categories = template_categories(template_children)
     print(f"  카테고리: {categories}")
 
-    carryover: dict[str, list[str]] = {}
-    print(f"전날({yesterday_str}) 페이지 검색 중...")
-    yesterday_id = find_yesterday_page(yesterday_str)
-    if yesterday_id:
-        carryover = extract_unchecked_by_category(get_blocks(yesterday_id))
-        total = sum(len(v) for v in carryover.values())
-        print(f"  미완료 {total}개 이월")
-    else:
-        print("  전날 페이지 없음")
-
     print(f"{current_year} 할일 페이지의 # 할 일 섹션 파싱 중...")
     recurring, urgent_pool = parse_recurring_todos(get_blocks(year_page_id), now)
     print(f"  반복 {len(recurring)}개, 빠른시일 풀 {len(urgent_pool)}개")
@@ -684,7 +610,7 @@ def main():
 
     classified = classify_items(categories, recurring, calendar_events, urgent_pool, now)
 
-    body = build_page(today_str, month_page_id, template_children, carryover, classified)
+    body = build_page(today_str, month_page_id, template_children, classified)
     result = api_request("POST", "/pages", body)
     print(f"[{today_str} TODO] 생성 완료: {result.get('url', '')}")
 
