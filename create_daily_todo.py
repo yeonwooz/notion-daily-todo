@@ -166,14 +166,18 @@ def heading_matches_today(heading: str, today: datetime) -> bool:
     h = heading.strip()
     weekday_idx = today.weekday()  # Mon=0
     weekday_name = WEEKDAY_KO[weekday_idx]
+    is_weekend = weekday_idx >= 5
+
+    # "매일 ... (주말 제외)" / "평일만" 등 주말 제외 명시가 있으면 주말엔 매칭 안 함
+    excludes_weekend = "주말 제외" in h or "주말제외" in h or "평일만" in h
 
     if "매일" in h:
-        return True
+        return not (is_weekend and excludes_weekend)
     if weekday_name in h and "마다" in h:
         return True
-    if "주말" in h and weekday_idx >= 5:
+    if "주말" in h and not excludes_weekend and is_weekend:
         return True
-    if "평일" in h and weekday_idx < 5:
+    if "평일" in h and not is_weekend:
         return True
 
     m = re.search(r"매월\s*(\d{1,2})\s*일", h)
